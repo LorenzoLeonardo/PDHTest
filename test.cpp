@@ -129,16 +129,14 @@ void FillICMPData(char* icmp_data, int datasize)
 	char* datapart = NULL;
 
 	icmp_hdr = (ICMP_HDR*)icmp_data;
-	icmp_hdr->byType = ICMP_ECHO;        // Request an ICMP echo
+	icmp_hdr->byType = ICMP_ECHO;  
 	icmp_hdr->byCode = 0;
 	icmp_hdr->usID = (USHORT)GetCurrentProcessId();
 	icmp_hdr->checksum = 0;
 	icmp_hdr->usSeq = 0;
 
 	datapart = icmp_data + sizeof(ICMP_HDR);
-	//
-	// Place some junk in the buffer
-	//
+
 	memset(datapart, 'E', datasize - sizeof(ICMP_HDR));
 }
 
@@ -149,7 +147,7 @@ void FillICMPData(char* icmp_data, int datasize)
 //    This function calculates the 16-bit one's complement sum
 //    of the supplied buffer (ICMP) header
 //
-USHORT checksum(USHORT* buffer, int size)
+USHORT CheckSum(USHORT* buffer, int size)
 {
 	unsigned long cksum = 0;
 
@@ -199,52 +197,32 @@ void DecodeIPOptions(char* buf, int bytes)
 //    The response is an IP packet. We must decode the IP header to
 //    locate the ICMP data.
 //
-bool DecodeICMPHeader(string ipAdd, char* buf, int bytes,
-	struct sockaddr_in* from)
+bool DecodeICMPHeader(USHORT usSeq, char* buf, int bytes, struct sockaddr_in* from)
 {
 	IPV4_HDR* iphdr = NULL;
 	ICMP_HDR* icmphdr = NULL;
 	unsigned short  iphdrlen;
-	DWORD           tick;
-	static   int    icmpcount = 0;
 
 	iphdr = (IPV4_HDR*)buf;
 	// Number of 32-bit words * 4 = bytes
 	iphdrlen = iphdr->ucIPHeaderLen * 4;
-	tick = GetTickCount();
 
-	if ((iphdrlen == MAX_IP_HDR_SIZE) && (!icmpcount))
-		DecodeIPOptions(buf, bytes);
+	if (bytes < iphdrlen + ICMP_MIN)
+		return false;
 
-	if (bytes < iphdrlen + ICMP_MIN) {
-//		printf("Too few bytes from %s\n", inet_ntoa(from->sin_addr));
-	}
 	icmphdr = (ICMP_HDR*)(buf + iphdrlen);
 
 	if (icmphdr->byType != ICMP_ECHOREPLY)
-	{
-	//	printf("%s: nonecho type %d recvd\n", ipAdd.c_str(), icmphdr->byType);
-		return false;
-	}
+			return false;
+
 	// Make sure this is an ICMP reply to something we sent!
 	//
 	if (icmphdr->usID != (USHORT)GetCurrentProcessId())
-	{
-	//	printf("someone else's packet!\n");
 		return false;
-	}
 
-	USHORT nStart = atoi(ipAdd.substr(ipAdd.rfind('.', ipAdd.size()) + 1, ipAdd.size()).c_str());
-	if (icmphdr->usSeq == nStart)
-	{
+	if (icmphdr->usSeq == usSeq)
 		return true;
-	}
-	//printf("%s: %d bytes received", ipAdd.c_str(), bytes);
-	//printf(" icmp_seq = %d. ", icmphdr->usSeq);
-	//printf(" time: %d ms", tick - icmphdr->ulTimeStamp);
-	//printf("\n");
 
-	icmpcount++;
 	return false;
 }
 
@@ -260,63 +238,116 @@ typedef void(*FNPtr)(const char*,bool);
 
 FNPtr gPTR;
 
-void CALLBACK CompletionROUTINE(
-	IN DWORD dwError,
-	IN DWORD cbTransferred,
-	IN LPWSAOVERLAPPED lpOverlapped,
-	IN DWORD dwFlags
-)
+
+bool CheckDeviceEx(string ipAddress, string& hostname, string& sMacAddress)
 {
-	if (dwError != 0)
+	SOCKET sockRaw;
+	const char* lpdest = ipAddress.c_str();
+	char* icmp_data = NULL, * recvbuf = NULL;
+	struct sockaddr_in dest, from;
+	int iResult = 0, timeoutsend = 5000, timeoutrecv = 5000, fromlen = sizeof(from);
+	struct hostent* hp = NULL;
+	USHORT usSequenceNumber = atoi(ipAddress.substr(ipAddress.rfind('.', ipAddress.size()) + 1, ipAddress.size()).c_str());
+	bool bRet = false;
+
+	icmp_data = (char*)malloc(MAX_PACKET);
+	if (!icmp_data)
+		return bRet;
+	memset((void*)icmp_data, 0, MAX_PACKET);
+	
+	recvbuf = (char*)malloc(MAX_PACKET);
+	if (!recvbuf)
+		return bRet;
+	memset((void*)recvbuf, 0, MAX_PACKET);
+
+	sockRaw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (sockRaw == INVALID_SOCKET)
+		goto CLEANPUP;
+
+	iResult = setsockopt(sockRaw, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeoutsend, sizeof(timeoutsend));
+	if (iResult == SOCKET_ERROR)
+		goto CLEANPUP;
+
+	iResult = setsockopt(sockRaw, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeoutrecv, sizeof(timeoutrecv));
+	if (iResult == SOCKET_ERROR)
+		goto CLEANPUP;
+	
+	memset(&dest, 0, sizeof(dest));
+	dest.sin_family = AF_INET;
+	if ((dest.sin_addr.s_addr = inet_addr(lpdest)) == INADDR_NONE)
 	{
-		printf("Error occured during IOCP completion: %d\n", dwError);
+		if ((hp = gethostbyname(lpdest)) != NULL)
+		{
+			memcpy(&(dest.sin_addr), hp->h_addr, hp->h_length);
+			dest.sin_family = hp->h_addrtype;
+		}
 	}
-	if (cbTransferred <= 0)
+	datasize += sizeof(ICMP_HDR);
+
+	FillICMPData(icmp_data, datasize);
+
+	((ICMP_HDR*)icmp_data)->byType = ICMP_ECHO;
+	((ICMP_HDR*)icmp_data)->checksum = 0;
+	((ICMP_HDR*)icmp_data)->ulTimeStamp = GetTickCount();
+	((ICMP_HDR*)icmp_data)->usSeq = usSequenceNumber;
+	((ICMP_HDR*)icmp_data)->checksum = CheckSum((USHORT*)icmp_data, datasize);
+
+	iResult = sendto(sockRaw, icmp_data, datasize, 0,
+		(struct sockaddr*)&dest, sizeof(dest));
+	if (iResult == SOCKET_ERROR)
+		goto CLEANPUP;
+
+	iResult = recvfrom(sockRaw, recvbuf, MAX_PACKET, 0, (struct sockaddr*)&from, &fromlen);
+	if (iResult == SOCKET_ERROR)
+		goto CLEANPUP;
+	else
 	{
-		printf("Server initiated disconnect.  bytes transferred <=0.\n");
+		if (DecodeICMPHeader(usSequenceNumber, recvbuf, iResult, &from))
+			bRet = true;
 	}
+
+CLEANPUP:
+	if(sockRaw!=INVALID_SOCKET)
+		closesocket(sockRaw);
+	free(recvbuf);
+	free(icmp_data);
+	recvbuf = NULL;
+	icmp_data = NULL;
+	
+	return bRet;
 }
 void SecondThreadFunc(void* pArguments)
 {
-	//mtx.lock();
-	char* icmp_data = NULL, * recvbuf = NULL;
-	SOCKET sockRaw = INVALID_SOCKET;
+	//SOCKET sockRaw;
+	string hostname, macAddress;
+	string ipAdd = *(string*)pArguments;
+	if(CheckDeviceEx(ipAdd,hostname, macAddress))
+		gPTR(ipAdd.c_str(), true);
+/*	char* icmp_data = NULL, * recvbuf = NULL;
+	
 	struct sockaddr_in dest, from;
-	int bread, fromlen = sizeof(from), timeoutsend = 5000, timeoutrecv= 5000, ret;
-	string* inPut = (string*)pArguments;
-	const char* lpdest = inPut->c_str();
-
-	WSABUF DataBuf;
-	DWORD dwBytesRecv = 0;
-	DWORD dwBytesSent = 0;
-	DWORD dwFlags = 0;
-	USHORT nStart = atoi(inPut->substr(inPut->rfind('.', inPut->size()) + 1, inPut->size()).c_str());
-
+	int bread, fromlen = sizeof(from), timeoutsend = 5000, timeoutrecv= 5000;
+	string* ipAddress = (string*)pArguments;
+	const char* lpdest = ipAddress->c_str();
+	USHORT usSequenceNumber = atoi(ipAddress->substr(ipAddress->rfind('.', ipAddress->size()) + 1, ipAddress->size()).c_str());
+	int bwrote;
 	unsigned int addr = 0;
 	USHORT seq_no = 0;
 	struct hostent* hp = NULL;
-	IpOptionHeader ipopt;
+
 
 	icmp_data = (char*)malloc(MAX_PACKET);
 	recvbuf = (char*)malloc(MAX_PACKET);
 	memset((void*)icmp_data, 0, MAX_PACKET);
 	memset((void*)recvbuf, 0, MAX_PACKET);
 
-
-
 	if (!icmp_data)
-	{
-		printf("HeapAlloc() failed: %d\n", GetLastError());\
-			gPTR(lpdest, false);
 		goto CLEANUP;
-	}
-	
 
-	
+		
 	sockRaw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (sockRaw == INVALID_SOCKET) {
-		printf("WSASocket() failed: %d\n", WSAGetLastError());
-		gPTR(lpdest, false);
+	if (sockRaw == INVALID_SOCKET)
+	{
 		goto CLEANUP;
 	}
 
@@ -335,11 +366,9 @@ void SecondThreadFunc(void* pArguments)
 		gPTR(lpdest, false);
 		goto CLEANUP;
 	}
+
 	memset(&dest, 0, sizeof(dest));
 
-	// 
-	// Resolve the endpoint's name if necessary 
-	// 
 	dest.sin_family = AF_INET;
 	if ((dest.sin_addr.s_addr = inet_addr(lpdest)) == INADDR_NONE)
 	{
@@ -347,39 +376,24 @@ void SecondThreadFunc(void* pArguments)
 		{
 			memcpy(&(dest.sin_addr), hp->h_addr, hp->h_length);
 			dest.sin_family = hp->h_addrtype;
-	//		printf("dest.sin_addr = %s\n", inet_ntoa(dest.sin_addr));
 		}
 		else
 		{
-			printf("gethostbyname() failed: %d\n",
-				WSAGetLastError());
-			gPTR(lpdest, false);
 			goto CLEANUP;
 		}
 	}
 
-	//
-	// Create the ICMP packet
-	//
 	datasize += sizeof(ICMP_HDR);
 
 
 	FillICMPData(icmp_data, datasize);
-	//
-	// Start sending/receiving ICMP packets
-	//
-	//while (1)
-	//{
-	//	static int nCount = 0;
-	int        bwrote;
 
-	//if (nCount++ == 4)
-	//	break;
-	((ICMP_HDR*)icmp_data)->byType = 8;
+
+	((ICMP_HDR*)icmp_data)->byType = ICMP_ECHO;
 	((ICMP_HDR*)icmp_data)->checksum = 0;
 	((ICMP_HDR*)icmp_data)->ulTimeStamp = GetTickCount();
-	((ICMP_HDR*)icmp_data)->usSeq = nStart;//seq_no++;
-	((ICMP_HDR*)icmp_data)->checksum =	checksum((USHORT*)icmp_data, datasize);
+	((ICMP_HDR*)icmp_data)->usSeq = usSequenceNumber;//seq_no++;
+	((ICMP_HDR*)icmp_data)->checksum =	CheckSum((USHORT*)icmp_data, datasize);
 
 	//mtx.lock();
 
@@ -390,7 +404,7 @@ void SecondThreadFunc(void* pArguments)
 	{
 		if (WSAGetLastError() == WSAETIMEDOUT)
 		{
-			printf("%s: timed out\n", inPut->c_str());
+			printf("%s: timed out\n", ipAddress->c_str());
 			gPTR(lpdest, false);
 			goto CLEANUP;
 		}
@@ -400,24 +414,23 @@ void SecondThreadFunc(void* pArguments)
 	}
 
 	bread = recvfrom(sockRaw, recvbuf, MAX_PACKET, 0,	(struct sockaddr*)&from, &fromlen);
-	//mtx.unlock();
+
 	if (bread == SOCKET_ERROR)
 	{
 		DWORD dwRet = WSAGetLastError();
 		if (dwRet == WSAETIMEDOUT)
 		{
-	//		printf("%s: timed out\n", inPut.c_str());
+	//		printf("%s: timed out\n", ipAddress.c_str());
 			gPTR(lpdest, false);
 			goto CLEANUP;
 		}
-	//	printf("recvfrom() failed: %d\n", WSAGetLastError());
 		gPTR(lpdest, false);
 		goto CLEANUP;
 	}
 	else
 	{
 		
-		if (DecodeICMPHeader(lpdest, recvbuf, bread, &from))
+		if (DecodeICMPHeader(usSequenceNumber, recvbuf, bread, &from))
 			gPTR(lpdest, true);
 		else
 			gPTR(lpdest, false);
@@ -431,9 +444,9 @@ CLEANUP:
 	if (sockRaw != INVALID_SOCKET)
 		closesocket(sockRaw);
 
-	delete inPut;
-	inPut = NULL;
-	//mtx.unlock();
+	delete ipAddress;
+	ipAddress = NULL;
+	//mtx.unlock();*/
 	return;
 }
 
